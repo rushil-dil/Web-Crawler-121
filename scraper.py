@@ -1,16 +1,86 @@
+import os
 import re
 import json
-from urllib.parse import urlparse, urljoin, urldefrag
+import hashlib
+import threading
+import atexit
+from collections import Counter, defaultdict
+from urllib.parse import urlparse, urldefrag, urljoin, urlunparse
+
 from bs4 import BeautifulSoup
 
-MAX_CONTENT_SIZE = 5 * 1024 * 1024  # 5 MB
 
-ALLOWED_DOMAINS = frozenset([
+# ---------------------------------------------------------------------------
+# Allowed crawl scope (per assignment spec)
+# ---------------------------------------------------------------------------
+
+ALLOWED_HOST_SUFFIXES = (
+    ".ics.uci.edu",
+    ".cs.uci.edu",
+    ".informatics.uci.edu",
+    ".stat.uci.edu",
+)
+ALLOWED_HOSTS_EXACT = (
     "ics.uci.edu",
     "cs.uci.edu",
     "informatics.uci.edu",
     "stat.uci.edu",
-])
+)
+
+
+# ---------------------------------------------------------------------------
+# Filters: file extensions and trap path / query patterns
+# ---------------------------------------------------------------------------
+
+DISALLOWED_EXT = re.compile(
+    r".*\.(css|js|bmp|gif|jpe?g|ico"
+    r"|png|tiff?|mid|mp2|mp3|mp4"
+    r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
+    r"|ps|eps|tex|ppt|pptx|ppsx|pps|key|odp"
+    r"|doc|docx|odt|xls|xlsx|ods|names"
+    r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
+    r"|epub|dll|cnf|tgz|sha1|apk|war|ear"
+    r"|thmx|mso|arff|rtf|jar|csv|tsv"
+    r"|rm|smil|wmv|swf|wma|zip|rar|gz|z|lz|xz"
+    r"|mat|nb|cdf|sql|sqlite|db"
+    r"|svg|webp|webm|mka|m4a|aac|flac|opus"
+    r"|woff2?|ttf|eot|otf"
+    r"|ipynb|c|cpp|h|py|java|class)$"
+)
+
+TRAP_PATH_PATTERN = re.compile(
+    r"(/calendar(?:/|$)|/events?/\d{4}|"
+    r"/\d{4}/\d{2}/\d{2}(?:/|$)|/\d{4}-\d{2}-\d{2}(?:/|$)|"
+    r"/page/\d{3,}(?:/|$)|"
+    r"/wp-(?:login|admin|json)|"
+    r"/feed/?$|/atom/?$|/rss/?$|"
+    r"/(?:trackback|pingback)/?$|"
+    r"/files/|/sampledata/|/supplement/)",
+    re.IGNORECASE,
+)
+
+TRAP_QUERY_PATTERN = re.compile(
+    r"(?:^|&)(?:phpsessid|jsessionid|sessionid|sid="
+    r"|share=|replytocom="
+    r"|action=(?:login|edit|history|raw|diff|source|print|download|rss)"
+    r"|do=(?:login|edit|diff|revisions|media|export|backlink)"
+    r"|format=(?:txt|xml|atom|rss|ical|ics)"
+    r"|ical=|outlook-ical=|tribe-bar-date="
+    r"|redirect_to=|redirect=|return=|returnto=)",
+    re.IGNORECASE,
+)
+
+DROP_QUERY_KEYS = frozenset({
+    "phpsessid", "jsessionid", "sid", "sessionid",
+    "utm_source", "utm_medium", "utm_campaign",
+    "utm_term", "utm_content", "fbclid", "gclid",
+    "share", "replytocom",
+})
+
+
+# ---------------------------------------------------------------------------
+# Stop-words list (from the assignment link)
+# ---------------------------------------------------------------------------
 
 STOP_WORDS = frozenset([
     "a", "about", "above", "after", "again", "against", "all", "am", "an",
@@ -36,138 +106,303 @@ STOP_WORDS = frozenset([
     "yourself", "yourselves",
 ])
 
-ANALYTICS_FILE = "analytics.json"
-_analytics = None
+
+# ---------------------------------------------------------------------------
+# Tunable heuristics
+# ---------------------------------------------------------------------------
+
+MAX_URL_LENGTH = 300
+MAX_PATH_DEPTH = 12
+MAX_REPEATED_SEGMENT = 2
+MIN_PAGE_WORDS = 50
+MAX_PAGE_BYTES = 8 * 1024 * 1024
 
 
-def _load_analytics():
-    global _analytics
-    if _analytics is not None:
-        return _analytics
+# ---------------------------------------------------------------------------
+# Persistent analytics — answers the four report questions across restarts
+# ---------------------------------------------------------------------------
+
+ANALYTICS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "analytics.json"
+)
+_FLUSH_INTERVAL = 25
+_lock = threading.Lock()
+_pending_writes = 0
+
+
+def _empty_state():
+    return {
+        "unique_urls": set(),
+        "longest": {"url": None, "words": 0},
+        "word_freq": Counter(),
+        "subdomain_pages": defaultdict(set),
+        "content_hashes": set(),
+    }
+
+
+def _load_state():
+    if not os.path.exists(ANALYTICS_FILE):
+        return _empty_state()
     try:
-        with open(ANALYTICS_FILE) as f:
-            _analytics = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        _analytics = {
-            "page_count": 0,
-            "longest_page": {"url": "", "word_count": 0},
-            "word_counts": {},
-            "ics_subdomains": {},
-        }
-    return _analytics
+        with open(ANALYTICS_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return _empty_state()
+    state = _empty_state()
+    state["unique_urls"] = set(data.get("unique_urls", []))
+    state["longest"] = data.get("longest", {"url": None, "words": 0})
+    state["word_freq"] = Counter(data.get("word_freq", {}))
+    state["subdomain_pages"] = defaultdict(
+        set, {k: set(v) for k, v in data.get("subdomain_pages", {}).items()}
+    )
+    state["content_hashes"] = set(data.get("content_hashes", []))
+    return state
 
 
-def _save_analytics():
-    with open(ANALYTICS_FILE, "w") as f:
-        json.dump(_analytics, f)
+_STATE = _load_state()
 
 
-def _update_analytics(url, words):
-    data = _load_analytics()
-    data["page_count"] += 1
+def _flush_state():
+    payload = {
+        "unique_urls": sorted(_STATE["unique_urls"]),
+        "longest": _STATE["longest"],
+        "word_freq": dict(_STATE["word_freq"]),
+        "subdomain_pages": {
+            k: sorted(v) for k, v in _STATE["subdomain_pages"].items()
+        },
+        "content_hashes": list(_STATE["content_hashes"]),
+    }
+    tmp = ANALYTICS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, ANALYTICS_FILE)
 
-    wc = len(words)
-    if wc > data["longest_page"]["word_count"]:
-        data["longest_page"] = {"url": url, "word_count": wc}
 
-    counts = data["word_counts"]
-    for word in words:
-        w = word.lower()
-        if len(w) >= 2 and w not in STOP_WORDS:
-            counts[w] = counts.get(w, 0) + 1
+atexit.register(lambda: _flush_state() if _STATE["unique_urls"] else None)
 
-    host = urlparse(url).hostname or ""
-    if host.endswith(".ics.uci.edu"):
-        data["ics_subdomains"][host] = data["ics_subdomains"].get(host, 0) + 1
 
-    _save_analytics()
+# ---------------------------------------------------------------------------
+# URL helpers
+# ---------------------------------------------------------------------------
 
+def normalize(url):
+    """Defragment + canonicalise so two equivalent URLs hash equal."""
+    if not url:
+        return None
+    try:
+        url, _ = urldefrag(url)
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    port = ""
+    try:
+        if parsed.port is not None and parsed.port not in (80, 443):
+            port = f":{parsed.port}"
+    except ValueError:
+        return None
+    netloc = f"{host}{port}"
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    query = parsed.query
+    if query:
+        kept = []
+        for piece in query.split("&"):
+            key = piece.split("=", 1)[0].lower()
+            if key in DROP_QUERY_KEYS:
+                continue
+            kept.append(piece)
+        query = "&".join(kept)
+    return urlunparse((parsed.scheme, netloc, path, parsed.params, query, ""))
+
+
+def _host_allowed(host):
+    if not host:
+        return False
+    host = host.lower()
+    if host in ALLOWED_HOSTS_EXACT:
+        return True
+    return any(host.endswith(suffix) for suffix in ALLOWED_HOST_SUFFIXES)
+
+
+def _looks_like_trap(parsed):
+    if len(parsed.geturl()) > MAX_URL_LENGTH:
+        return True
+    path = parsed.path or ""
+    if TRAP_PATH_PATTERN.search(path):
+        return True
+    if parsed.query and TRAP_QUERY_PATTERN.search(parsed.query):
+        return True
+    segments = [s for s in path.split("/") if s]
+    if len(segments) > MAX_PATH_DEPTH:
+        return True
+    counts = Counter(segments)
+    if any(c > MAX_REPEATED_SEGMENT for c in counts.values()):
+        return True
+    for i in range(len(segments) - 2):
+        if segments[i] == segments[i + 1] == segments[i + 2]:
+            return True
+    return False
+
+
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z']{1,}")
+
+
+def _tokenize(text):
+    return [w.lower() for w in _WORD_RE.findall(text)]
+
+
+# ---------------------------------------------------------------------------
+# Crawler entry points
+# ---------------------------------------------------------------------------
 
 def scraper(url, resp):
     links = extract_next_links(url, resp)
-    return [link for link in links if is_valid(link)]
+    out, seen = [], set()
+    for raw in links:
+        normed = normalize(raw)
+        if not normed or normed in seen:
+            continue
+        seen.add(normed)
+        if is_valid(normed):
+            out.append(normed)
+    return out
+
 
 def extract_next_links(url, resp):
-    # Implementation required.
-    # url: the URL that was used to get the page
-    # resp.url: the actual url of the page
-    # resp.status: the status code returned by the server. 200 is OK, you got the page. Other numbers mean that there was some kind of problem.
-    # resp.error: when status is not 200, you can check the error here, if needed.
-    # resp.raw_response: this is where the page actually is. More specifically, the raw_response has two parts:
-    #         resp.raw_response.url: the url, again
-    #         resp.raw_response.content: the content of the page!
-    # Return a list with the hyperlinks (as strings) scrapped from resp.raw_response.content
-
-    # Non-200 covers all cache server error codes (600-608) too
-    if resp.status != 200 or resp.raw_response is None:
+    if resp is None or resp.status != 200:
+        return []
+    raw = getattr(resp, "raw_response", None)
+    if raw is None or not getattr(raw, "content", None):
+        return []
+    content = raw.content
+    if len(content) > MAX_PAGE_BYTES:
         return []
 
-    content = resp.raw_response.content
-    if not content or len(content) > MAX_CONTENT_SIZE:
+    headers = getattr(raw, "headers", None) or {}
+    ctype = (headers.get("Content-Type") or headers.get("content-type") or "").lower()
+    if ctype and "html" not in ctype and "xml" not in ctype:
         return []
+
+    final_url = getattr(raw, "url", None) or url
 
     try:
-        soup = BeautifulSoup(content, "lxml")
+        soup = BeautifulSoup(content, "html.parser")
     except Exception:
         return []
 
-    words = re.findall(r"[a-zA-Z]{2,}", soup.get_text())
-    _update_analytics(url, words)
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    text = soup.get_text(" ", strip=True)
+    tokens = _tokenize(text)
+    word_count = len(tokens)
 
-    base_url = resp.raw_response.url or url
-    links = []
-    for tag in soup.find_all("a", href=True):
-        href = tag["href"].strip()
-        if not href:
+    base_url = final_url
+    base_tag = soup.find("base", href=True)
+    if base_tag:
+        try:
+            base_url = urljoin(final_url, base_tag["href"])
+        except ValueError:
+            pass
+
+    if word_count < MIN_PAGE_WORDS:
+        _record_visit(final_url, 0, None, None)
+        return _harvest_links(soup, base_url)
+
+    content_hash = hashlib.md5(" ".join(tokens).encode("utf-8")).hexdigest()
+    _record_visit(final_url, word_count, tokens, content_hash)
+    return _harvest_links(soup, base_url)
+
+
+def _harvest_links(soup, base_url):
+    out = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith(
+            ("javascript:", "mailto:", "tel:", "#", "data:", "ftp:", "file:")
+        ):
             continue
-        absolute = urljoin(base_url, href)
-        defragged, _ = urldefrag(absolute)
-        links.append(defragged)
+        try:
+            out.append(urljoin(base_url, href))
+        except ValueError:
+            continue
+    return out
 
-    return links
+
+def _record_visit(url, word_count, tokens, content_hash):
+    global _pending_writes
+    normed = normalize(url)
+    if not normed:
+        return
+    host = (urlparse(normed).hostname or "").lower()
+
+    with _lock:
+        if content_hash and content_hash in _STATE["content_hashes"]:
+            tokens = None
+        elif content_hash:
+            _STATE["content_hashes"].add(content_hash)
+
+        is_new = normed not in _STATE["unique_urls"]
+        _STATE["unique_urls"].add(normed)
+
+        if is_new and host.endswith("uci.edu"):
+            sub_host = host[4:] if host.startswith("www.") else host
+            _STATE["subdomain_pages"][sub_host].add(normed)
+
+        if word_count > _STATE["longest"]["words"]:
+            _STATE["longest"] = {"url": normed, "words": word_count}
+
+        if tokens:
+            _STATE["word_freq"].update(
+                w for w in tokens
+                if w not in STOP_WORDS and len(w) > 1
+            )
+
+        _pending_writes += 1
+        if _pending_writes >= _FLUSH_INTERVAL:
+            try:
+                _flush_state()
+                _pending_writes = 0
+            except OSError:
+                pass
+
 
 def is_valid(url):
-    # Decide whether to crawl this url or not.
-    # If you decide to crawl it, return True; otherwise return False.
-    # There are already some conditions that return False.
     try:
         parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not _host_allowed(host):
+        return False
+    if DISALLOWED_EXT.match((parsed.path or "").lower()):
+        return False
+    if _looks_like_trap(parsed):
+        return False
+    return True
 
-        if parsed.scheme not in {"http", "https"}:
-            return False
 
-        hostname = parsed.hostname
-        if not hostname:
-            return False
+# ---------------------------------------------------------------------------
+# `python3 scraper.py` -> dump report from analytics.json
+# ---------------------------------------------------------------------------
 
-        # Only crawl within the four allowed domains and their subdomains
-        if not any(hostname == d or hostname.endswith("." + d) for d in ALLOWED_DOMAINS):
-            return False
+def print_report(top_n=50):
+    state = _load_state()
+    print(f"Unique pages: {len(state['unique_urls'])}")
+    longest = state["longest"]
+    print(f"Longest page: {longest['url']} ({longest['words']} words)\n")
+    print(f"Top {top_n} words:")
+    for word, count in state["word_freq"].most_common(top_n):
+        print(f"  {word}\t{count}")
+    print(f"\nSubdomains under uci.edu:")
+    for sub in sorted(state["subdomain_pages"]):
+        print(f"  {sub}, {len(state['subdomain_pages'][sub])}")
 
-        path_parts = [p for p in parsed.path.split("/") if p]
 
-        # Repeating path segments signal a loop trap (e.g. /a/b/a/)
-        if len(path_parts) != len(set(path_parts)):
-            return False
-
-        # Excessively deep paths are almost always traps
-        if len(path_parts) > 10:
-            return False
-
-        # Long query strings create near-infinite URL spaces
-        if len(parsed.query) > 200:
-            return False
-
-        return not re.match(
-            r".*\.(css|js|bmp|gif|jpe?g|ico"
-            + r"|png|tiff?|mid|mp2|mp3|mp4"
-            + r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
-            + r"|ps|eps|tex|ppt|pptx|doc|docx|xls|xlsx|names"
-            + r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
-            + r"|epub|dll|cnf|tgz|sha1"
-            + r"|thmx|mso|arff|rtf|jar|csv"
-            + r"|rm|smil|wmv|swf|wma|zip|rar|gz)$", parsed.path.lower())
-
-    except TypeError:
-        print ("TypeError for ", parsed)
-        raise
+if __name__ == "__main__":
+    print_report()
