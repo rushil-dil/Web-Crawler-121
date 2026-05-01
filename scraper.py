@@ -33,6 +33,7 @@ STOPWORDS = frozenset({
     "who", "who's", "whom", "why", "why's", "with", "won't", "would",
     "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your",
     "yours", "yourself", "yourselves",
+    "obj", "endobj", "stream", "endstream", "flatedecode",
 })
 
 ALLOWED_DOMAIN_SUFFIXES = (
@@ -54,6 +55,8 @@ REPORT_PATH = os.path.join(_HERE, "crawler_report.txt")
 
 _TOKEN_RE = re.compile(r"[a-z][a-z']+")
 _TRAP_PATTERNS = (
+    re.compile(r"/pix/", re.IGNORECASE),
+    re.compile(r"/junkyard/", re.IGNORECASE),
     re.compile(r"/calendar(?:/|$)", re.IGNORECASE),
     re.compile(r"/events?/.*\d{4}", re.IGNORECASE),
     re.compile(r"/\d{4}/\d{2}/\d{2}(?:/|$)"),
