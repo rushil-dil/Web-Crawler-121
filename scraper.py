@@ -229,28 +229,28 @@ def scraper(url, resp):
     if cleaned_url in state["crawled_urls"] or cleaned_url in state["skipped_urls"]:
         return []
 
+    raw_links = extract_next_links(cleaned_url, resp)
+    valid_links = [link for link in raw_links if is_valid(link)]
+
     if _is_duplicate_content(resp, state):
         state["skipped_urls"].add(cleaned_url)
         _save_state(state)
-        return []
+        return valid_links
 
     tokens = extract_text_tokens(resp)
-    if len(tokens) < MIN_TOKENS_FOR_PAGE:
+
+    if len(tokens) >= MIN_TOKENS_FOR_PAGE:
+        state["crawled_urls"].add(cleaned_url)
+        _record_subdomain(cleaned_url, state)
+        _update_longest(cleaned_url, len(tokens), state)
+        _tally_words(tokens, state)
+    else:
         state["skipped_urls"].add(cleaned_url)
-        _save_state(state)
-        return []
-
-    state["crawled_urls"].add(cleaned_url)
-    _record_subdomain(cleaned_url, state)
-    _update_longest(cleaned_url, len(tokens), state)
-    _tally_words(tokens, state)
-
-    raw_links = extract_next_links(cleaned_url, resp)
-    valid_links = [link for link in raw_links if is_valid(link)]
 
     _save_state(state)
     if len(state["crawled_urls"]) % REPORT_FLUSH_EVERY == 0:
         write_report(state)
+
     return valid_links
 
 
