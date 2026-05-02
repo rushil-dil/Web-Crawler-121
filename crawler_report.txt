@@ -1,0 +1,85 @@
+Unique Pages: 3990
+
+
+Longest Page: https://ics.uci.edu/~eppstein/pubs/all.html with 34003 tokens
+
+
+Top 50 most frequent words:
+married: 29485
+may: 15361
+jan: 15342
+dec: 15020
+mar: 14931
+jun: 14464
+sep: 13712
+oct: 13632
+apr: 13503
+feb: 13452
+jul: 13343
+aug: 13268
+nov: 13152
+ramesh: 9596
+family: 9048
+krakow: 7007
+data: 6682
+ics: 6561
+jain: 6448
+listing: 6106
+manhattan: 5997
+information: 5938
+uci: 5430
+podgorze: 5391
+current: 5253
+unsigned: 5213
+eppstein: 5109
+const: 5079
+research: 5025
+can: 4895
+search: 4807
+graph: 4772
+past: 4631
+computing: 4422
+time: 4358
+algorithms: 4262
+will: 4137
+one: 4018
+computer: 3977
+students: 3778
+abraham: 3703
+new: 3488
+read: 3486
+size: 3392
+sara: 3340
+edu: 3273
+using: 3215
+companies: 3183
+top: 3161
+books: 3151
+
+
+
+Subdomain page counts:
+acoi.ics.uci.edu, 4
+archive-beta.ics.uci.edu, 2
+archive.ics.uci.edu, 185
+checkin.ics.uci.edu, 1
+chenli.ics.uci.edu, 5
+cloudberry.ics.uci.edu, 2
+courselisting.ics.uci.edu, 1
+cs.uci.edu, 3
+dale-cooper-v0.ics.uci.edu, 1
+flamingo.ics.uci.edu, 317
+grape.ics.uci.edu, 7
+graphics.ics.uci.edu, 1
+ics.uci.edu, 1846
+intranet.ics.uci.edu, 1
+ipubmed.ics.uci.edu, 1
+isg.ics.uci.edu, 2
+mover.ics.uci.edu, 15
+myip.ics.uci.edu, 1
+ngs.ics.uci.edu, 1471
+speedtest.ics.uci.edu, 1
+stat.uci.edu, 3
+swiki.ics.uci.edu, 5
+vision.ics.uci.edu, 11
+wiki.ics.uci.edu, 104
