@@ -67,6 +67,8 @@ _TRAP_PATTERNS = (
     re.compile(r"/page/\d{3,}(?:/|$)"),
     re.compile(r"/feed/?$", re.IGNORECASE),
     re.compile(r"/(?:atom|rss)/?$", re.IGNORECASE),
+    re.compile(r"/genealogy/", re.IGNORECASE), # Avoid pages like https://ics.uci.edu/~dhirschb/genealogy/Krakow/Families/Bader.html#Gele
+    re.compile(r"family[-_ ]?listing", re.IGNORECASE), #
 )
 _DOWNLOAD_BUCKETS = (
     "/files/", "/sampledata/", "/supplement/",
